@@ -1,0 +1,13 @@
+services:
+  wazuh-sidecar:
+    build: .
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - sidecar-data:/data
+    restart: unless-stopped
+
+volumes:
+  sidecar-data:
+
