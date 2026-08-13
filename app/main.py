@@ -1,10 +1,11 @@
-"""Wazuh alert ingestion, incident reporting, and Discord delivery service."""
+"""Wazuh alert ingestion, incident reporting, and chat delivery service."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ class Settings(BaseModel):
     ingest_api_key: str = Field(default_factory=lambda: os.getenv("INGEST_API_KEY", ""))
     report_min_severity: int = Field(default_factory=lambda: int(os.getenv("REPORT_MIN_SEVERITY", "10")))
     discord_webhook_url: str = Field(default_factory=lambda: os.getenv("DISCORD_WEBHOOK_URL", ""))
+    slack_webhook_url: str = Field(default_factory=lambda: os.getenv("SLACK_WEBHOOK_URL", ""))
     llm_api_url: str = Field(default_factory=lambda: os.getenv("LLM_API_URL", ""))
     llm_api_key: str = Field(default_factory=lambda: os.getenv("LLM_API_KEY", ""))
     llm_model: str = Field(default_factory=lambda: os.getenv("LLM_MODEL", "gpt-4o-mini"))
@@ -54,10 +56,14 @@ def initialize_database() -> None:
             CREATE TABLE IF NOT EXISTS reports (
               id INTEGER PRIMARY KEY AUTOINCREMENT, alert_fingerprint TEXT NOT NULL,
               severity INTEGER NOT NULL, created_at TEXT NOT NULL, report TEXT NOT NULL,
-              discord_status TEXT NOT NULL
+              discord_status TEXT NOT NULL, slack_status TEXT NOT NULL DEFAULT 'not_configured'
             );
             """
         )
+        # Existing Sidecar databases need the delivery status field added in place.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(reports)")}
+        if "slack_status" not in columns:
+            conn.execute("ALTER TABLE reports ADD COLUMN slack_status TEXT NOT NULL DEFAULT 'not_configured'")
 
 
 @app.on_event("startup")
@@ -151,6 +157,101 @@ async def deliver_discord(report: str) -> str:
         return "failed"
 
 
+def shorten_for_slack(text: str, limit: int = 2700) -> str:
+    """Slack limits section text to 3,000 characters; leave space for a notice."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 70].rstrip() + "\n\n_Additional details are available from the Sidecar API._"
+
+
+def slack_markdown(text: str) -> str:
+    """Convert the small Markdown subset used by reports into Slack mrkdwn."""
+    text = text.replace("**", "*")
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    return shorten_for_slack(text)
+
+
+def split_report_sections(report: str) -> dict[str, str]:
+    """Split an LLM Markdown report into named Slack-friendly sections."""
+    sections: dict[str, list[str]] = {}
+    current = "Incident details"
+    sections[current] = []
+    for line in report.splitlines():
+        heading = re.match(r"^#{1,6}\s+(.+?)\s*$", line)
+        if heading:
+            current = heading.group(1).strip()
+            sections.setdefault(current, [])
+        else:
+            sections[current].append(line)
+    return {heading: slack_markdown("\n".join(lines)) for heading, lines in sections.items() if "\n".join(lines).strip()}
+
+
+def report_section(sections: dict[str, str], *names: str) -> str:
+    """Get the first matching report section without relying on exact heading case."""
+    wanted = {name.casefold() for name in names}
+    for heading, body in sections.items():
+        if heading.casefold() in wanted:
+            return body
+    return ""
+
+
+async def deliver_slack(alert: dict[str, Any], report: str, severity: int) -> str:
+    if not settings.slack_webhook_url:
+        return "not_configured"
+    rule = str(get_nested(alert, "rule", "description", default="Wazuh alert"))[:160]
+    rule_id = str(get_nested(alert, "rule", "id", default="unknown"))
+    agent = str(get_nested(alert, "agent", "name", default="manager/unknown"))
+    source = str(get_nested(alert, "data", "srcip", default="not available"))
+    alert_id = str(alert.get("id") or "not available")
+    timestamp = str(alert.get("timestamp") or "not available")
+    sections = split_report_sections(report)
+    summary = report_section(sections, "Executive Summary", "Incident details") or slack_markdown(report)
+    evidence = report_section(sections, "Evidence")
+    mitre = report_section(sections, "MITRE ATT&CK Techniques")
+    if mitre:
+        evidence = "\n\n".join(part for part in (evidence, f"*MITRE ATT&CK*\n{mitre}") if part)
+    evidence = shorten_for_slack(evidence)
+    actions = report_section(sections, "Prioritized Containment/Validation Actions", "Recommended triage", "Recommended Actions")
+    severity_label, severity_icon = (
+        ("Critical", ":red_circle:") if severity >= 13 else ("High", ":large_orange_circle:")
+    )
+    payload = {
+        "username": "Wazuh Sidecar",
+        "icon_emoji": ":shield:",
+        "text": f"{severity_label} Wazuh incident: {rule}",
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": "Security Incident • Wazuh", "emoji": True}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"{severity_icon} *{severity_label} severity alert — investigation required*\n{rule}"}},
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Severity*\n{severity}/15 ({severity_label})"},
+                    {"type": "mrkdwn", "text": f"*Affected asset*\n{agent}"},
+                    {"type": "mrkdwn", "text": f"*Rule ID*\n{rule_id}"},
+                    {"type": "mrkdwn", "text": f"*Source*\n{source}"},
+                    {"type": "mrkdwn", "text": f"*Detected*\n{timestamp}"},
+                    {"type": "mrkdwn", "text": f"*Alert ID*\n{alert_id}"},
+                ],
+            },
+            {"type": "divider"},
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Executive summary*\n{summary}"}},
+        ],
+    }
+    if evidence:
+        payload["blocks"].append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Key evidence*\n{evidence}"}})
+    if actions:
+        payload["blocks"].append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Recommended actions*\n{actions}"}})
+    payload["blocks"].append({"type": "context", "elements": [{"type": "mrkdwn", "text": "Generated by Wazuh Sidecar • Validate findings before taking containment action."}]})
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(settings.slack_webhook_url, json=payload)
+            response.raise_for_status()
+        return "sent" if response.text.strip() == "ok" else "failed"
+    except httpx.HTTPError:
+        return "failed"
+
+
 async def process_alert(alert: dict[str, Any]) -> dict[str, Any]:
     fingerprint, alert_id, severity = normalized_alert(alert)
     received_at = datetime.now(timezone.utc).isoformat()
@@ -165,17 +266,18 @@ async def process_alert(alert: dict[str, Any]) -> dict[str, Any]:
         return {"fingerprint": fingerprint, "status": "stored", "severity": severity}
     report = await generate_report(alert, severity)
     discord_status = await deliver_discord(report)
+    slack_status = await deliver_slack(alert, report, severity)
     with database() as conn:
         report_id = conn.execute(
-            "INSERT INTO reports(alert_fingerprint, severity, created_at, report, discord_status) VALUES (?, ?, ?, ?, ?)",
-            (fingerprint, severity, datetime.now(timezone.utc).isoformat(), report, discord_status),
+            "INSERT INTO reports(alert_fingerprint, severity, created_at, report, discord_status, slack_status) VALUES (?, ?, ?, ?, ?, ?)",
+            (fingerprint, severity, datetime.now(timezone.utc).isoformat(), report, discord_status, slack_status),
         ).lastrowid
-    return {"fingerprint": fingerprint, "status": "reported", "severity": severity, "report_id": report_id, "discord_status": discord_status}
+    return {"fingerprint": fingerprint, "status": "reported", "severity": severity, "report_id": report_id, "discord_status": discord_status, "slack_status": slack_status}
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "report_min_severity": settings.report_min_severity, "llm_configured": bool(settings.llm_api_url and settings.llm_api_key), "discord_configured": bool(settings.discord_webhook_url)}
+    return {"status": "ok", "report_min_severity": settings.report_min_severity, "llm_configured": bool(settings.llm_api_url and settings.llm_api_key), "discord_configured": bool(settings.discord_webhook_url), "slack_configured": bool(settings.slack_webhook_url)}
 
 
 @app.post("/v1/alerts", dependencies=[Depends(require_api_key)])

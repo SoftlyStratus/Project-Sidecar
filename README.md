@@ -1,12 +1,12 @@
 # Wazuh Incident Sidecar
 
-A small service that receives Wazuh alerts, creates an LLM-assisted incident report for alerts at a chosen severity, and publishes those reports to a Discord incoming webhook.
+A small service that receives Wazuh alerts, creates an LLM-assisted incident report for alerts at a chosen severity, and publishes those reports to Discord and/or Slack incoming webhooks.
 
 ## Run it
 
 ```powershell
 Copy-Item .env.example .env
-# edit .env and set INGEST_API_KEY, DISCORD_WEBHOOK_URL, and LLM credentials
+# edit .env and set INGEST_API_KEY, chat webhook URL(s), and LLM credentials
 docker compose up --build -d
 ```
 
@@ -46,7 +46,7 @@ Restart the Wazuh manager after updating its configuration. The integration scri
 ## Behavior
 
 - Alerts below `REPORT_MIN_SEVERITY` are stored but do not open a report.
-- Alerts at or above the threshold are summarized by the configured OpenAI-compatible model and dispatched to Discord.
+- Alerts at or above the threshold are summarized by the configured OpenAI-compatible model and dispatched to any configured Discord and Slack webhook.
 - If LLM setup is omitted or unavailable, the service still produces a deterministic report from the Wazuh fields.
 - Duplicate alerts (same Wazuh alert `id`) are ignored.
 
@@ -56,6 +56,16 @@ Restart the Wazuh manager after updating its configuration. The integration scri
 - `POST /v1/alerts` — ingest one alert or an `alerts` array
 - `GET /v1/alerts?limit=50` — recent alerts
 - `GET /v1/reports?limit=50` — recent generated reports
+
+## Slack setup
+
+Create a Slack Incoming Webhook for the channel that should receive incident reports, then set its webhook URL in `.env`:
+
+```env
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+```
+
+Restart the container after updating `.env`. The Sidecar posts a structured Slack message with severity, detection details, affected asset, source, and the generated report. Slack is optional; leave the value empty to disable it.
 
 ## Security notes
 
